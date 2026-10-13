@@ -310,6 +310,28 @@ class StorageManager:
         Raises:
             Exception: Allocation exceptions propagate; they are not overflow.
         """
+        full = self.reserve_write_with_status(keys, layout_desc)
+        return {k: m for k, (_, m) in full.items() if m is not None}
+
+    def reserve_write_with_status(
+        self,
+        keys: list[ObjectKey],
+        layout_desc: MemoryLayoutDesc,
+    ) -> dict[ObjectKey, L1OperationResult]:
+        """Reserve like :meth:`reserve_write` and keep each key's ``L1Error``.
+
+        ``reserve_write`` drops every key that did not get a buffer. Cross-rank
+        commit needs to tell a real allocation failure apart from a key that is
+        already resident (``KEY_NOT_WRITABLE``).
+
+        Args:
+            keys: Object keys to reserve.
+            layout_desc: Layout of each object.
+
+        Returns:
+            One ``(L1Error, MemoryObj | None)`` per requested key. A buffer is
+            present only on ``SUCCESS``.
+        """
         reserve_result: dict[ObjectKey, L1OperationResult] = {
             key: (L1Error.OUT_OF_MEMORY, None) for key in keys
         }
@@ -328,9 +350,9 @@ class StorageManager:
             # terminal conflicts. Each candidate is visited at most once.
             pending = [k for k in pending if results[k][0] == L1Error.OUT_OF_MEMORY]
 
-        result = {k: m for k, (e, m) in reserve_result.items() if m is not None}
+        result = {k: m for k, (_, m) in reserve_result.items() if m is not None}
         successful_keys = list(result.keys())
-        failed_keys = [k for k, (e, m) in reserve_result.items() if m is None]
+        failed_keys = [k for k, (_, m) in reserve_result.items() if m is None]
         self._event_bus.publish(
             Event(
                 event_type=EventType.SM_WRITE_RESERVED,
@@ -340,7 +362,6 @@ class StorageManager:
                 },
             )
         )
-
         oom_keys = [
             k for k, (e, _) in reserve_result.items() if e == L1Error.OUT_OF_MEMORY
         ]
@@ -351,8 +372,7 @@ class StorageManager:
                     metadata={"during": "l1_store", "keys": oom_keys},
                 )
             )
-
-        return result
+        return reserve_result
 
     def finish_write(
         self,
@@ -437,6 +457,24 @@ class StorageManager:
         )
 
         # TODO: global key states update
+
+    def abort_write_by_owner(self, completion: L1WriteCompletion) -> None:
+        """Drop staged reservations without admitting them.
+
+        Used when another tensor-parallel rank failed the same chunk. The
+        objects never become visible to readers.
+
+        Args:
+            completion: Owner/key groups captured from the reserved objects.
+        """
+        if any(owner not in self._l1_managers_by_id for owner, _ in completion):
+            raise ValueError("write abort requires a registered L1 owner")
+        for owner, keys in completion:
+            if not keys:
+                continue
+            self._l1_managers_by_id[owner].finish_write_and_delete(
+                keys, tag=_L1_WRITE_TAG
+            )
 
     @contextmanager
     def read_prefetched_results(

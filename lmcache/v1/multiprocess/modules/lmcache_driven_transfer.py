@@ -18,7 +18,12 @@ from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
 )
+from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.storage_manager import L1WriteCompletion
+from lmcache.v1.multiprocess.cross_rank_store import (
+    CrossRankStoreGate,
+    RankArrival,
+)
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
 from lmcache.v1.memory_management import MemoryObj
@@ -49,6 +54,77 @@ from lmcache.v1.platform.cache_context import create_cache_context
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
+
+
+def _owned_keys_to_completion(
+    pairs: list[tuple[int, Any]],
+) -> L1WriteCompletion:
+    """Group ``(owner, key)`` pairs into a finish/abort payload.
+
+    Args:
+        pairs: Staged objects, each tagged with its L1 owner id.
+
+    Returns:
+        Owner/key groups accepted by ``finish_write_by_owner``.
+    """
+    groups: dict[int, list[ObjectKey]] = {}
+    for owner, obj_key in pairs:
+        groups.setdefault(owner, []).append(obj_key)
+    return list(groups.items())
+
+
+def _rank_chunk_readiness(
+    num_chunks: int,
+    obj_keys_per_obj_group: list[list[ObjectKey]],
+    skipped_chunks: Sequence[Sequence[bool]],
+    status_per_group: list[dict[ObjectKey, tuple[L1Error, MemoryObj | None]]],
+    store_succeeded: bool,
+) -> tuple[list[bool], list[list[tuple[int, ObjectKey]]], list[int]]:
+    """Decide which chunks this rank can commit, and which buffers it holds.
+
+    A chunk is ready when every object group either skipped it, reserved it,
+    or already had it resident (``KEY_NOT_WRITABLE``). An allocation failure
+    makes the chunk not ready, but any buffer this rank did reserve is still
+    returned so the gate can drop it.
+
+    Args:
+        num_chunks: Complete chunks in the store.
+        obj_keys_per_obj_group: Resolved keys, one list per object group.
+        skipped_chunks: Per group, True where the chunk was intentionally
+            not reserved.
+        status_per_group: Reservation result per object group.
+        store_succeeded: False when this rank raised before finishing.
+
+    Returns:
+        ``(ready, keys_by_chunk, nbytes_by_chunk)``.
+    """
+    ready: list[bool] = []
+    keys_by_chunk: list[list[tuple[int, ObjectKey]]] = [[] for _ in range(num_chunks)]
+    nbytes_by_chunk = [0] * num_chunks
+    for index in range(num_chunks):
+        ok = store_succeeded
+        for group_id, obj_keys in enumerate(obj_keys_per_obj_group):
+            if group_id < len(skipped_chunks) and skipped_chunks[group_id][index]:
+                continue
+            if group_id >= len(status_per_group):
+                ok = False
+                continue
+            found = status_per_group[group_id].get(obj_keys[index])
+            if found is None:
+                ok = False
+                continue
+            err, mem = found
+            if mem is not None:
+                owner = mem.get_l1_manager()
+                if owner is None:
+                    ok = False
+                    continue
+                keys_by_chunk[index].append((owner, obj_keys[index]))
+                nbytes_by_chunk[index] += mem.get_size()
+            elif err != L1Error.KEY_NOT_WRITABLE:
+                ok = False
+        ready.append(ok)
+    return ready, keys_by_chunk, nbytes_by_chunk
 
 
 def get_layout_desc(
@@ -207,6 +283,15 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             "release_imported_event",
             self._release_imported_event,
             payload_type=tuple[int, int],
+        )
+        self._cross_rank_gate = CrossRankStoreGate(
+            commit=self._commit_owned_keys,
+            abort=self._abort_owned_keys,
+        )
+        self._device_host_func_dispatcher.register(
+            "cross_rank_store_settle",
+            self._on_cross_rank_store_settle,
+            payload_type=tuple[str, int, int, int],
         )
         self._device_host_func_dispatcher.start()
 
@@ -720,12 +805,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 )
             )
 
-            # Worker 0 only: bindings depend on token content alone, so one
-            # report covers every rank's keys. Published before finish_write
-            # is enqueued so the token bindings precede the write-finished
-            # events on the bus.
-            if key.worker_id == 0 and self._ctx.event_bus.has_subscribers(
-                EventType.MP_TOKENS
+            # More than one rank: token bindings wait until every rank has
+            # reported. Publishing them here would name chunks the other rank
+            # may never write. A single rank still publishes before commit.
+            cross_rank = key.worker_id is not None and key.world_size > 1
+            if (
+                not cross_rank
+                and key.worker_id == 0
+                and self._ctx.event_bus.has_subscribers(EventType.MP_TOKENS)
             ):
                 self._publish_token_bindings(key, obj_keys_per_obj_group[0])
 
@@ -746,8 +833,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
             reserved_dict: dict[ObjectKey, MemoryObj] = {}
             all_dict: dict[ObjectKey, MemoryObj] = {}
+            status_per_group: list[dict[ObjectKey, tuple[L1Error, MemoryObj | None]]] = []
             total_bytes: int = 0
             store_succeeded = False
+            completion: L1WriteCompletion = []
             try:
                 for obj_group_id in range(num_object_groups):
                     obj_keys = obj_keys_per_obj_group[obj_group_id]
@@ -760,9 +849,20 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         self._ctx.chunk_size,
                         object_group_id=obj_group_id,
                     )
-                    reserved_dict = self._ctx.storage_manager.reserve_write(
-                        keys_to_reserve, layout_desc
-                    )
+                    if cross_rank:
+                        status = self._ctx.storage_manager.reserve_write_with_status(
+                            keys_to_reserve, layout_desc
+                        )
+                        status_per_group.append(status)
+                        reserved_dict = {
+                            obj_key: mem
+                            for obj_key, (_, mem) in status.items()
+                            if mem is not None
+                        }
+                    else:
+                        reserved_dict = self._ctx.storage_manager.reserve_write(
+                            keys_to_reserve, layout_desc
+                        )
                     all_dict.update(reserved_dict)
                     if reserved_dict:
                         total_bytes += next(
@@ -799,34 +899,56 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 logger.exception("Cannot store keys due to exception")
             finally:
                 event_backend.record_event(event, cache_context.stream)
-                # Fail closed: commit the reserved objects only when every chunk
-                # copied successfully; otherwise the whole store is skipped.
-                stored_count = len(all_dict) if store_succeeded else 0
-                if stored_count:
-                    submit_callback_to_stream(
-                        cache_context.cupy_stream,
-                        "finish_write_by_owner",
-                        completion,
+                if cross_rank:
+                    # Commit waits until the other ranks report. The returned
+                    # mask stays empty so a caller cannot advertise chunks
+                    # that a sibling rank may still force us to drop.
+                    self._handoff_cross_rank_store(
+                        key=key,
+                        cache_context=cache_context,
+                        instance_id=instance_id,
+                        model_name=model_name,
+                        transfer_key=transfer_key,
+                        num_chunks=num_chunks,
+                        obj_keys_per_obj_group=obj_keys_per_obj_group,
+                        skipped_chunks=skipped_chunks,
+                        status_per_group=status_per_group,
+                        store_succeeded=store_succeeded,
+                        started_at=st,
                     )
+                    stored_count = 0
                 else:
-                    total_bytes = 0
-                num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
-                self._ctx.event_bus.publish_on_stream(
-                    cache_context.cupy_stream,
-                    Event(
-                        event_type=EventType.MP_STORE_END,
-                        session_id=key.request_id,
-                        metadata={
-                            "stored_count": stored_count,
-                            "device": str(cache_context.device),
-                            "engine_id": instance_id,
-                            "model_name": model_name,
-                            "total_bytes": total_bytes,
-                            "num_tokens": num_tokens,
-                            "transfer_key": transfer_key,
-                        },
-                    ),
-                )
+                    # Fail closed: commit the reserved objects only when every
+                    # chunk copied successfully; otherwise the whole store is
+                    # skipped.
+                    stored_count = len(all_dict) if store_succeeded else 0
+                    if stored_count:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "finish_write_by_owner",
+                            completion,
+                        )
+                    else:
+                        total_bytes = 0
+                    num_tokens = (
+                        num_chunks * self._ctx.chunk_size if stored_count else 0
+                    )
+                    self._ctx.event_bus.publish_on_stream(
+                        cache_context.cupy_stream,
+                        Event(
+                            event_type=EventType.MP_STORE_END,
+                            session_id=key.request_id,
+                            metadata={
+                                "stored_count": stored_count,
+                                "device": str(cache_context.device),
+                                "engine_id": instance_id,
+                                "model_name": model_name,
+                                "total_bytes": total_bytes,
+                                "num_tokens": num_tokens,
+                                "transfer_key": transfer_key,
+                            },
+                        ),
+                    )
 
         ed = time.perf_counter()
         if stored_count:
@@ -837,11 +959,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             )
 
         # A chunk is stored only when every object group committed its key.
-        stored_mask = [
-            store_succeeded
-            and all(keys[i] in all_dict for keys in obj_keys_per_obj_group)
-            for i in range(num_chunks)
-        ]
+        # Cross-rank commit is decided after this returns, so the mask stays
+        # empty and does not claim chunks that may still be dropped.
+        if cross_rank:
+            stored_mask = [False] * num_chunks
+        else:
+            stored_mask = [
+                store_succeeded
+                and all(keys[i] in all_dict for keys in obj_keys_per_obj_group)
+                for i in range(num_chunks)
+            ]
         return (
             event_backend.export_event(event, cache_context.device),
             store_succeeded,
@@ -1107,8 +1234,146 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             retrieve_succeeded,
         )
 
+    def _commit_owned_keys(self, pairs: list[tuple[int, Any]]) -> None:
+        """Admit staged objects after every rank agreed.
+
+        Args:
+            pairs: ``(l1 owner id, object key)`` for the objects to admit.
+        """
+        completion = _owned_keys_to_completion(pairs)
+        if completion:
+            self._ctx.storage_manager.finish_write_by_owner(completion)
+
+    def _abort_owned_keys(self, pairs: list[tuple[int, Any]]) -> None:
+        """Drop staged objects when another rank was not ready.
+
+        Args:
+            pairs: ``(l1 owner id, object key)`` for the objects to drop.
+        """
+        completion = _owned_keys_to_completion(pairs)
+        if completion:
+            self._ctx.storage_manager.abort_write_by_owner(completion)
+
+    def _on_cross_rank_store_settle(self, payload: tuple[str, int, int, int]) -> None:
+        """Device-copy finished for one rank of a cross-rank store.
+
+        Args:
+            payload: ``(request_id, start, end, worker_id)``.
+        """
+        request_id, start, end, worker_id = payload
+        self._cross_rank_gate.complete_copy((request_id, start, end), worker_id)
+
+    def _handoff_cross_rank_store(
+        self,
+        key: IPCCacheServerKey,
+        cache_context: BaseCacheContext,
+        instance_id: int,
+        model_name: str,
+        transfer_key: str,
+        num_chunks: int,
+        obj_keys_per_obj_group: list[list[ObjectKey]],
+        skipped_chunks: Sequence[Sequence[bool]],
+        status_per_group: list[dict[ObjectKey, tuple[L1Error, MemoryObj | None]]],
+        store_succeeded: bool,
+        started_at: float,
+    ) -> None:
+        """Report this rank and commit only the chunks every rank has ready.
+
+        The device copy is already queued. Buffers stay staged until the copy
+        callback, so a sibling rank can drop them without freeing memory the
+        copy is still writing.
+
+        Args:
+            key: Store key, including worker id and world size.
+            cache_context: Device context the copy was queued on.
+            instance_id: GPU instance id, echoed on the store-end event.
+            model_name: Model name echoed on the store-end event.
+            transfer_key: Transfer id echoed on the store-end event.
+            num_chunks: Complete chunks in this store.
+            obj_keys_per_obj_group: Resolved keys, one list per object group.
+            skipped_chunks: Per group, True where the chunk is intentionally
+                empty and was not reserved.
+            status_per_group: Reservation result per object group. Shorter
+                than the group count when reservation raised.
+            store_succeeded: False when this rank's own copy or reservation
+                raised.
+            started_at: ``time.perf_counter`` value from the start of store.
+        """
+        assert key.worker_id is not None
+        ready, keys_by_chunk, nbytes_by_chunk = _rank_chunk_readiness(
+            num_chunks,
+            obj_keys_per_obj_group,
+            skipped_chunks,
+            status_per_group,
+            store_succeeded,
+        )
+        has_staged = any(keys_by_chunk)
+
+        def _on_end(num_tokens: int, total_bytes: int) -> None:
+            if num_tokens:
+                logger.info(
+                    "Stored %d tokens in %.3f seconds",
+                    num_tokens,
+                    time.perf_counter() - started_at,
+                )
+            self._ctx.event_bus.publish(
+                Event(
+                    event_type=EventType.MP_STORE_END,
+                    session_id=key.request_id,
+                    metadata={
+                        "stored_count": (
+                            num_tokens // self._ctx.chunk_size if num_tokens else 0
+                        ),
+                        "device": str(cache_context.device),
+                        "engine_id": instance_id,
+                        "model_name": model_name,
+                        "total_bytes": total_bytes,
+                        "num_tokens": num_tokens,
+                        "transfer_key": transfer_key,
+                    },
+                )
+            )
+
+        publish_tokens = None
+        if key.worker_id == 0 and self._ctx.event_bus.has_subscribers(
+            EventType.MP_TOKENS
+        ):
+            group0_keys = obj_keys_per_obj_group[0]
+
+            def _publish(indices: list[int]) -> None:
+                self._publish_token_bindings(
+                    key, group0_keys, chunk_indices=indices
+                )
+
+            publish_tokens = _publish
+
+        group_key = (key.request_id, key.start, key.end)
+        self._cross_rank_gate.submit(
+            group_key,
+            RankArrival(
+                worker_id=key.worker_id,
+                world_size=key.world_size,
+                ready=ready,
+                keys_by_chunk=keys_by_chunk,
+                nbytes_by_chunk=nbytes_by_chunk,
+                chunk_size=self._ctx.chunk_size,
+                copy_done=not has_staged,
+                publish_tokens=publish_tokens,
+                on_end=_on_end,
+            ),
+        )
+        if has_staged:
+            submit_callback_to_stream(
+                cache_context.cupy_stream,
+                "cross_rank_store_settle",
+                (key.request_id, key.start, key.end, key.worker_id),
+            )
+
     def _publish_token_bindings(
-        self, key: IPCCacheServerKey, obj_keys: list[ObjectKey]
+        self,
+        key: IPCCacheServerKey,
+        obj_keys: list[ObjectKey],
+        chunk_indices: list[int] | None = None,
     ) -> None:
         """Publish one ``MP_TOKENS`` event for ``key``'s chunks.
 
@@ -1121,6 +1386,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         Args:
             key: The IPC key of the store being submitted.
             obj_keys: One ObjectKey per complete chunk, in chunk order.
+            chunk_indices: Chunks to publish. ``None`` publishes every chunk
+                in the key range. Cross-rank store passes only the chunks
+                every rank agreed to commit.
         """
         # Complete chunks in [key.start, key.end) paired with the absolute
         # position of each chunk's first token. Prefix-chained chunk hashes
@@ -1147,6 +1415,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 key.end,
             )
             return
+        if chunk_indices is not None:
+            obj_keys = [obj_keys[index] for index in chunk_indices]
+            token_chunks = [token_chunks[index] for index in chunk_indices]
+            token_offsets = [token_offsets[index] for index in chunk_indices]
+            if not token_chunks:
+                return
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_TOKENS,
